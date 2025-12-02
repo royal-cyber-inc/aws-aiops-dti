@@ -1,0 +1,3 @@
+requests>=2.31.0
+opensearch-py
+requests-aws4auth
