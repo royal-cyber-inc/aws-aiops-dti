@@ -42,7 +42,9 @@ SERVICENOW_USER = os.getenv("SERVICENOW_USER", "")
 SERVICENOW_PASS = os.getenv("SERVICENOW_PASS", "")
 
 DATADOG_QUERY_LOG_LIMIT = int(os.getenv("DATADOG_QUERY_LOG_LIMIT", "50"))
-BEDROCK_MODEL = os.getenv("BEDROCK_MODEL", "")
+CLAUDE_MODEL = os.getenv(
+    "CLAUDE_MODEL", "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "2000"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "5000"))
 TITAN_MODEL = os.getenv("TITAN_MODEL", "amazon.titan-embed-image-v1")
@@ -214,7 +216,7 @@ def call_bedrock_service_check(user_input: str, unique_services: set[str]) -> st
 
     try:
         resp = bedrock.invoke_model(
-            modelId=BEDROCK_MODEL,
+            modelId=CLAUDE_MODEL,
             body=json.dumps(payload),
             contentType="application/json",
             accept="application/json",
@@ -303,7 +305,7 @@ datadog_context:
 
     try:
         resp = bedrock.invoke_model(
-            modelId=BEDROCK_MODEL,
+            modelId=CLAUDE_MODEL,
             body=json.dumps(payload),
             contentType="application/json",
             accept="application/json",
