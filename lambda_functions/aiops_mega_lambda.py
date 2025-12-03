@@ -489,6 +489,7 @@ def lambda_handler(event, context):
             "target_service": selected_service,
             "datadog_logs_context": dd_log_context,
         }
+        LOG.info("Response payload: %s", response)
         # 8. If issue is valid, optionally create ticket in ServiceNow
         if llm_out.get("issue_valid"):
             # Use LLM analysis and suggested action for the ticket description
