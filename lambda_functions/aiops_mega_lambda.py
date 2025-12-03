@@ -422,15 +422,22 @@ def lambda_handler(event, context):
     """
     Main entry point for the Lambda function.
     """
-    user_input = (event.get("user_input") or "").strip()
-
-    if not user_input:
-        return {
-            "statusCode": 400,
-            "body": json.dumps({"error": "Bad request: missing 'user_input'"}),
-        }
-
     try:
+        if "body" in event and event["body"]:
+            # Decode the JSON string in the 'body' field and extract user input
+            body_data = json.loads(event["body"])
+            user_input = (body_data.get("user_input") or "").strip()
+
+            if not user_input:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps(
+                        {
+                            "error": f"Bad request: missing 'user_input', got the following input: {event['body']}"
+                        }
+                    ),
+                }
+
         # ensure_opensearch_index_mapping()
 
         # 1. Always query Datadog logs for a list of recent error/warn events
