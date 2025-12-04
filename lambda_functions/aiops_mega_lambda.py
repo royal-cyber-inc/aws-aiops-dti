@@ -422,6 +422,7 @@ def lambda_handler(event, context):
     """
     Main entry point for the Lambda function.
     """
+    user_input = ""
     try:
         if "body" in event and event["body"]:
             # Decode the JSON string in the 'body' field and extract user input
@@ -497,12 +498,13 @@ def lambda_handler(event, context):
             "datadog_logs_context": dd_log_context,
         }
         LOG.info("Response payload: %s", response)
-        # 8. If issue is valid, optionally create ticket in ServiceNow
+
+        # 8. If issue is valid, create ticket in ServiceNow
         if llm_out.get("issue_valid"):
             # Use LLM analysis and suggested action for the ticket description
-            ticket_desc = f"User input: {user_input}\n\nLLM Analysis:\n{llm_out.get('analysis')}\n\nSuggested Action:\n{llm_out.get('suggested_action')}\n\nRelevant Logs:\n{dd_log_context[:2000]}"
+            ticket_desc = f"User input: {user_input}\n\nAI Agent's Analysis:\n{llm_out.get('analysis')}\n\nAI Agent's Suggested Action:\n{llm_out.get('suggested_action')}\n\nRelevant Logs:\n{dd_log_context}"
             ticket = servicenow_create_incident(
-                short_description=f"[{selected_service}] Issue: {user_input[:80]}",
+                short_description=f"[{selected_service}] Issue: {user_input}",
                 description=ticket_desc,
                 extra={"category": "LLM-Assisted Resolution"},
             )
