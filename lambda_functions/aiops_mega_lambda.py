@@ -11,6 +11,7 @@ to the main Bedrock model for analysis and suggested action.
 
 import os
 import json
+import re
 import logging
 import uuid
 import requests
@@ -47,6 +48,7 @@ CLAUDE_MODEL = os.getenv(
 )
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "2000"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "5000"))
+SERVICE_CHECK_MAX_TOKENS = 50
 TITAN_MODEL = os.getenv("TITAN_MODEL", "amazon.titan-embed-image-v1")
 
 # Similarity Threshold and Upload Bucket
@@ -95,6 +97,56 @@ def get_header_value(event, header_name):
         if k.lower() == header_name.lower():
             return v
     return None
+
+
+def invoke_claude_model(prompt: str, max_tokens: int) -> dict:
+    """
+    Generic function to invoke the Claude model via Bedrock for structured JSON output.
+    It handles the Boto3 invocation and robust regex-based JSON extraction.
+    """
+    LOG.info(f"Invoking Claude model: {CLAUDE_MODEL} with max_tokens: {max_tokens}")
+
+    # Content structure for text-only input
+    content = [{"type": "text", "text": prompt}]
+
+    payload = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": content}],
+    }
+
+    try:
+        # 1. Invoke the model
+        response = bedrock.invoke_model(
+            modelId=CLAUDE_MODEL,
+            body=json.dumps(payload),
+            contentType="application/json",
+            accept="application/json",
+        )
+
+        # 2. Read the Boto3 response body and parse the outer JSON envelope
+        response_body = json.loads(response["body"].read())
+
+        # 3. Extract the raw text output from the model's response structure
+        raw_text_output = response_body["content"][0]["text"].strip()
+        LOG.info("Successfully received response from Claude.")
+
+        # 4. Use regex to find and extract the JSON object (robust parsing)
+        json_match = re.search(r"\{.*\}", raw_text_output, re.DOTALL)
+
+        if json_match:
+            return json.loads(json_match.group(0))
+        else:
+            LOG.error(
+                "Could not find a valid JSON object in the model's response. Raw response: %s",
+                raw_text_output,
+            )
+            raise ValueError("Failed to parse JSON from Claude's response.")
+
+    except Exception as e:
+        LOG.exception("An error occurred during the Claude model invocation: %s", e)
+        # Re-raise the exception to be handled by the specific caller function
+        raise
 
 
 def datadog_query_logs(
@@ -179,70 +231,6 @@ def format_logs_for_llm(logs: list[dict], selected_service: str) -> str:
     return "\n".join(formatted_logs)
 
 
-def call_bedrock_service_check(user_input: str, unique_services: set[str]) -> str:
-    """
-    Invokes Bedrock model to check if the user_input is related to any of the
-    known unique_services.
-
-    Returns the *selected service name* or "N/A".
-    """
-    safe_input = (
-        (user_input or "")[:MAX_INPUT_CHARS].replace('"', '\\"').replace("\n", " ")
-    )
-
-    # The prompt explicitly asks for a selection from the list or 'N/A'
-    prompt = f"""
-    You are an AI assistant for routing user issues. Your task is to identify 
-    if the user's request mentions or implies any of the services provided in the list.
-
-    Service List: {list(unique_services)}
-
-    User Request: "{safe_input}"
-
-    Instructions:
-    1. If the User Request mentions a service from the list (e.g., "tr1 app," "api service"), 
-       return *only* the **exact service name** from the list.
-    2. If the User Request is generic, non-actionable, or does not mention any service 
-       from the list, return *only* the string **"N/A"**.
-
-    Output:
-    """
-
-    payload = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 20,  # Very small token limit for a quick, focused response
-        "messages": [{"role": "user", "content": prompt}],
-    }
-
-    try:
-        resp = bedrock.invoke_model(
-            modelId=CLAUDE_MODEL,
-            body=json.dumps(payload),
-            contentType="application/json",
-            accept="application/json",
-        )
-    except ClientError as e:
-        LOG.exception("Bedrock service check failed: %s", e)
-        # Fallback to N/A on error
-        return "N/A"
-
-    body_stream = resp.get("body")
-    if body_stream is None:
-        return "N/A"
-
-    raw = body_stream.read().decode("utf-8").strip()
-    # Clean up any potential formatting from the LLM
-    result = raw.replace('"', "").replace("`", "").strip()
-
-    LOG.info("Service Check LLM Raw Output: %s", result)
-
-    # Final check: ensure the result is either N/A or one of the known services
-    if result in unique_services:
-        return result
-
-    return "N/A"  # Default to N/A if LLM output is not clean or unexpected
-
-
 def servicenow_create_incident(
     short_description: str, description: str, extra: dict = {}
 ):
@@ -257,25 +245,73 @@ def servicenow_create_incident(
     return resp.json().get("result")
 
 
-def call_bedrock_issue_handler(user_input: str, dd_log_context: str):
+def call_bedrock_service_check(user_input: str, unique_services: set) -> str:
     """
-    Send `user_input` and `dd_log_context` to the main Bedrock model,
-    expecting a structured JSON output.
+    Builds the prompt for service selection and calls the generic LLM function.
+    Returns the selected service name or "N/A".
     """
     safe_input = (
         (user_input or "")[:MAX_INPUT_CHARS].replace('"', '\\"').replace("\n", " ")
     )
 
-    # Adding the log context to the prompt
+    service_list_with_fallback = list(unique_services) + ["N/A"]
+
+    prompt = f"""
+    You are an AI assistant for routing user issues. Your task is to select 
+    the best match between the 'User Request' and the 'Service List'.
+
+    Service List: {service_list_with_fallback}
+
+    User Request: "{safe_input}"
+
+    Instructions:
+    Return a JSON object with a single key 'service_key'. 
+    The value must be the **exact service name** from the list that is most relevant, 
+    or the string **"N/A"** if none are relevant. Do NOT include any markdown or extra text.
+
+    Example Output: {{"service_key": "TR1-app"}}
+
+    Output:
+    """
+
+    try:
+        result_dict = invoke_claude_model(
+            prompt=prompt, max_tokens=SERVICE_CHECK_MAX_TOKENS
+        )
+
+        selected_service = result_dict.get("service_key", "N/A").strip()
+
+        # Final validation
+        if selected_service in unique_services or selected_service == "N/A":
+            return selected_service
+
+        LOG.warning(
+            "LLM returned unexpected service key '%s'. Defaulting to N/A.",
+            selected_service,
+        )
+        return "N/A"
+
+    except Exception as e:
+        LOG.error("Service check failed during invocation or parsing: %s", e)
+        return "N/A"
+
+
+def call_bedrock_issue_handler(user_input: str, dd_log_context: str) -> dict:
+    """
+    Builds the prompt for full issue analysis and calls the generic LLM function.
+    Returns the structured analysis dictionary.
+    """
+    safe_input = (
+        (user_input or "")[:MAX_INPUT_CHARS].replace('"', '\\"').replace("\n", " ")
+    )
+
     prompt = f"""
 You are an issue-handling assistant.
 
 Task:
 - You receive a user-submitted issue ("user_input") and a summary of relevant 
   recent error/warn logs ("datadog_context") for the implied service.
-- Your job is to decide:
-    1. Is the input valid / meaningful / actionable?
-    2. If yes, propose a resolution or next-step action based on the logs.
+- Decide if the input is valid/actionable and propose a resolution based on the logs.
 
 Return a JSON object with exactly these keys:
 {{
@@ -286,61 +322,38 @@ Return a JSON object with exactly these keys:
 }}
 
 Constraints:
+- Your SOLE output must be a single, valid JSON object.
 - Use double quotes for all keys and string values.
 - Use lowercase JSON booleans (true, false).
-- Do not output any extra text outside the JSON object.
+- Do not output any extra text, explanations, or markdown outside the JSON object.
 
 Input:
 user_input: "{safe_input}"
 datadog_context: 
-```
+---
 {dd_log_context}
-```
+---
 """
-    payload = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": MAX_TOKENS,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-
     try:
-        resp = bedrock.invoke_model(
-            modelId=CLAUDE_MODEL,
-            body=json.dumps(payload),
-            contentType="application/json",
-            accept="application/json",
-        )
-    except ClientError as e:
-        LOG.exception("Bedrock invoke_model failed: %s", e)
-        raise
+        # Use the global MAX_TOKENS for the main analysis
+        result = invoke_claude_model(prompt=prompt, max_tokens=MAX_TOKENS)
 
-    body_stream = resp.get("body")
-    if body_stream is None:
-        raise RuntimeError("No body in Bedrock response")
-
-    raw = body_stream.read().decode("utf-8").strip()
-    LOG.debug("Raw Bedrock response: %s", raw)
-
-    try:
-        # LLM output may include markdown like '```json\n...\n```', strip it
-        clean_json = raw.strip().replace("```json", "").replace("```", "").strip()
-        result = json.loads(clean_json)
-    except json.JSONDecodeError:
-        LOG.error("Failed to parse JSON from Bedrock output: %s", raw)
-        # Attempt to recover common formatting errors for graceful failure
+    except Exception as e:
+        LOG.error("Main issue handler failed during invocation or parsing: %s", e)
+        # Return graceful error structure on failure
         result = {
             "issue_valid": False,
             "confidence": 0.0,
-            "analysis": f"LLM returned unparsable JSON: {raw[:200]}",
+            "analysis": f"Bedrock invocation or parsing failed: {e}",
             "suggested_action": "",
         }
 
-    # Validate schema
+    # Final structure validation: ensure all expected keys are present
+    final_result = {}
     for key in ("issue_valid", "confidence", "analysis", "suggested_action"):
-        if key not in result:
-            result[key] = None  # Add missing keys to prevent subsequent errors
+        final_result[key] = result.get(key)
 
-    return result
+    return final_result
 
 
 # TODO: Review the embedding feature once before using
@@ -453,30 +466,24 @@ def lambda_handler(event, context):
         selected_service = call_bedrock_service_check(user_input, unique_services)
         LOG.info("Bedrock Service Check Result: %s", selected_service)
 
-        # 4. Early Exit if no relevant service is detected
-        if selected_service == "N/A" and not unique_services:
-            # Handle case where no services were found at all AND the user was generic
+        # 4. Branching Logic (Early Exit if service is 'N/A')
+        if selected_service == "N/A":
+            # C1. Handle case where NO services were found OR user was generic
+            error_message = "Your request is too general."
+            if unique_services:
+                error_message += f" Please specify one of the following services mentioned in recent error/warn logs: {list(unique_services)}"
+            else:
+                error_message += (
+                    " No recent error/warn logs were found to provide context."
+                )
+
             return {
                 "statusCode": 200,
                 "body": json.dumps(
                     {
-                        "issue_valid": True,
-                        "analysis": "No service context provided, and no recent error/warn logs were found. Please provide the service or app name for a more targeted analysis.",
+                        "issue_valid": False,
+                        "analysis": error_message,
                         "suggested_action": "Request user to specify the application or service name.",
-                        "datadog_logs_count": 0,
-                        "servicenow_ticket": None,
-                    }
-                ),
-            }
-        elif selected_service == "N/A":
-            # Handle case where services were found, but the user didn't mention one
-            return {
-                "statusCode": 200,
-                "body": json.dumps(
-                    {
-                        "issue_valid": True,
-                        "analysis": f"Your request is too general. Please specify one of the following services mentioned in recent error/warn logs: {list(unique_services)}",
-                        "suggested_action": "Request user to specify a service name from the list.",
                         "datadog_logs_count": len(dd_logs_raw),
                         "servicenow_ticket": None,
                     }
